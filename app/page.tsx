@@ -58,16 +58,16 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Auth listener
-  useEffect(() => {
-    getUser().then((u) => { setUser(u ?? null); setAuthLoading(false) })
+// Register Service Worker
+useEffect(() => {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js").catch(console.error)
+  }
+}, [])
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null)
-      setAuthLoading(false)
-    })
-
-    return () => subscription.unsubscribe()
+// Auth listener
+useEffect(() => {
+  getUser().then((u) => { setUser(u ?? null); setAuthLoading(false) })
   }, [])
 
   // Load data when user logs in
