@@ -5,11 +5,18 @@ import {
   PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip,
   ResponsiveContainer, AreaChart, Area, CartesianGrid, Legend,
 } from "recharts"
+import type { User } from "@supabase/supabase-js"
 
 import { Transaction, Goal, Budgets } from "@/types"
 import { CATEGORIES_EXPENSE, MONTHS_ID } from "@/lib/constants"
 import { fmt, fmtShort, getMonthKey } from "@/lib/utils"
-import { KEYS, loadFromStorage, saveToStorage, removeFromStorage } from "@/lib/storage"
+import { supabase } from "@/lib/supabase"
+import {
+  signInWithGoogle, signOut, getUser,
+  loadTransactions, saveTransaction, deleteTransaction as deleteTxFromDB,
+  loadBudgets, saveBudgets,
+  loadGoals, saveGoal as saveGoalToDB, deleteGoalFromDB,
+} from "@/lib/storage"
 import { generateInsights } from "@/lib/insights"
 import { exportCSV, exportJSON } from "@/lib/export"
 
@@ -29,6 +36,8 @@ const TABS = [
 ]
 
 export default function Home() {
+  const [user, setUser] = useState<User | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [budgets, setBudgets] = useState<Budgets>({})
   const [goals, setGoals] = useState<Goal[]>([])
@@ -49,47 +58,35 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  // Load data
+  // Auth listener
   useEffect(() => {
-    Promise.all([
-      loadFromStorage<Transaction[]>(KEYS.tx),
-      loadFromStorage<Budgets>(KEYS.budgets),
-      loadFromStorage<Goal[]>(KEYS.goals),
-    ]).then(([tx, b, g]) => {
-      if (tx) setTransactions(tx)
-      if (b) setBudgets(b)
-      if (g) setGoals(g)
-      setLoaded(true)
+    getUser().then((u) => { setUser(u ?? null); setAuthLoading(false) })
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
     })
+
+    return () => subscription.unsubscribe()
   }, [])
 
-  // Auto-save
-  useEffect(() => { if (loaded) saveToStorage(KEYS.tx, transactions) }, [transactions, loaded])
-  useEffect(() => { if (loaded) saveToStorage(KEYS.budgets, budgets) }, [budgets, loaded])
-  useEffect(() => { if (loaded) saveToStorage(KEYS.goals, goals) }, [goals, loaded])
-
-  // Recurring transactions
+  // Load data when user logs in
   useEffect(() => {
-    if (!loaded) return
-    const recTxs = transactions.filter((t) => t.recurring)
-    const existingKeys = transactions.map(
-      (t) => t.date?.substring(0, 7) + "|" + t.category + "|" + t.amount
-    )
-    recTxs.forEach((rt) => {
-      const key = selectedMonth + "|" + rt.category + "|" + rt.amount
-      if (!existingKeys.includes(key) && selectedMonth > getMonthKey(rt.date)) {
-        const newTx: Transaction = {
-          ...rt,
-          id: crypto.randomUUID(),
-          date: selectedMonth + "-01",
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          note: (rt.note ? rt.note + " " : "") + "(auto-recurring)",
-        }
-        setTransactions((prev) => [newTx, ...prev])
-      }
-    })
-  }, [selectedMonth, loaded, transactions])
+    if (!user) { setLoaded(false); return }
+    Promise.all([loadTransactions(), loadBudgets(selectedMonth), loadGoals()])
+      .then(([tx, b, g]) => {
+        setTransactions(tx)
+        setBudgets(b)
+        setGoals(g)
+        setLoaded(true)
+      })
+  }, [user])
+
+  // Reload budgets when month changes
+  useEffect(() => {
+    if (!user || !loaded) return
+    loadBudgets(selectedMonth).then(setBudgets)
+  }, [selectedMonth, user, loaded])
 
   // Derived data
   const monthTxs = useMemo(
@@ -174,40 +171,61 @@ export default function Home() {
   }, [budgets, expByCategory])
 
   // Handlers
-  const saveTx = useCallback((tx: Transaction) => {
+  const saveTx = useCallback(async (tx: Transaction) => {
+    if (!user) return
     setTransactions((prev) => {
       const exists = prev.find((t) => t.id === tx.id)
       if (exists) return prev.map((t) => (t.id === tx.id ? tx : t))
       return [tx, ...prev]
     })
-  }, [])
+    await saveTransaction(tx, user.id)
+  }, [user])
 
-  const deleteTx = useCallback((id: string) => {
+  const deleteTx = useCallback(async (id: string) => {
     setTransactions((prev) => prev.filter((t) => t.id !== id))
+    await deleteTxFromDB(id)
   }, [])
 
-  const saveGoal = useCallback((g: Goal) => {
+  const handleSaveBudgets = useCallback(async (newBudgets: Budgets) => {
+    if (!user) return
+    setBudgets(newBudgets)
+    await saveBudgets(newBudgets, selectedMonth, user.id)
+  }, [user, selectedMonth])
+
+  const saveGoalHandler = useCallback(async (g: Goal) => {
+    if (!user) return
     setGoals((prev) => {
       const exists = prev.find((x) => x.id === g.id)
       if (exists) return prev.map((x) => (x.id === g.id ? g : x))
       return [...prev, g]
     })
-  }, [])
+    await saveGoalToDB(g, user.id)
+  }, [user])
 
-  const deleteGoal = useCallback((id: string) => {
+  const deleteGoal = useCallback(async (id: string) => {
     setGoals((prev) => prev.filter((g) => g.id !== id))
+    await deleteGoalFromDB(id)
   }, [])
 
   const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
-    if (!file) return
+    if (!file || !user) return
     const reader = new FileReader()
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const data = JSON.parse(ev.target?.result as string)
-        if (data.transactions) setTransactions(data.transactions)
-        if (data.budgets) setBudgets(data.budgets)
-        if (data.goals) setGoals(data.goals)
+        if (data.transactions) {
+          setTransactions(data.transactions)
+          for (const tx of data.transactions) {
+            await saveTransaction(tx, user.id)
+          }
+        }
+        if (data.goals) {
+          setGoals(data.goals)
+          for (const g of data.goals) {
+            await saveGoalToDB(g, user.id)
+          }
+        }
         alert("Import berhasil! ✅")
       } catch {
         alert("File tidak valid ❌")
@@ -217,21 +235,40 @@ export default function Home() {
     e.target.value = ""
   }
 
-  const resetAll = async () => {
-    if (confirm("RESET semua data? Tidak bisa di-undo!")) {
-      setTransactions([]); setBudgets({}); setGoals([])
-      await Promise.all(Object.values(KEYS).map((k) => removeFromStorage(k)))
-    }
-  }
+  // ══ LOGIN SCREEN ══
+  if (authLoading) return (
+    <div className="flex h-screen items-center justify-center bg-[#0C0E16]">
+      <div className="text-center">
+        <div className="mb-3 text-4xl animate-pulse">💎</div>
+        <div className="text-sm text-[#5A5E72]" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>Loading...</div>
+      </div>
+    </div>
+  )
 
-  // Loading
+  if (!user) return (
+    <div className="flex h-screen items-center justify-center bg-[#0C0E16] px-4" style={{ fontFamily: "'Outfit', sans-serif" }}>
+      <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=IBM+Plex+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
+      <div className="w-full max-w-sm rounded-2xl border border-[#1E2030] bg-[#161825] p-8 text-center">
+        <div className="mb-2 text-5xl">💎</div>
+        <h1 className="mb-1 text-2xl font-extrabold text-[#E2E4EA]">DompetKu</h1>
+        <p className="mb-8 text-sm text-[#5A5E72]">Smart Finance Tracker</p>
+        <button
+          onClick={signInWithGoogle}
+          className="flex w-full items-center justify-center gap-3 rounded-xl border border-[#2A2E42] bg-[#0E1019] px-4 py-3.5 text-sm font-semibold text-[#E2E4EA] cursor-pointer transition-all hover:border-[#6366F1]"
+        >
+          <svg width="18" height="18" viewBox="0 0 18 18"><path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/><path d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 009 18z" fill="#34A853"/><path d="M3.964 10.706A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.706V4.962H.957A8.996 8.996 0 000 9c0 1.452.348 2.827.957 4.038l3.007-2.332z" fill="#FBBC05"/><path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.962L3.964 7.294C4.672 5.166 6.656 3.58 9 3.58z" fill="#EA4335"/></svg>
+          Login dengan Google
+        </button>
+        <p className="mt-6 text-xs text-[#3A3E52]">Data kamu aman & tersimpan di cloud</p>
+      </div>
+    </div>
+  )
+
   if (!loaded) return (
     <div className="flex h-screen items-center justify-center bg-[#0C0E16]">
       <div className="text-center">
         <div className="mb-3 text-4xl animate-pulse">💎</div>
-        <div className="text-sm text-[#5A5E72]" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
-          Loading DompetKu...
-        </div>
+        <div className="text-sm text-[#5A5E72]" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>Loading DompetKu...</div>
       </div>
     </div>
   )
@@ -246,12 +283,13 @@ export default function Home() {
           <div className="flex h-9 w-9 items-center justify-center rounded-lg text-base" style={{ background: "linear-gradient(135deg,#6366F1,#A855F7)" }}>💎</div>
           <div>
             <div className="text-base font-extrabold" style={{ background: "linear-gradient(135deg,#C7D2FE,#E2E4EA)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>DompetKu</div>
-            <div className="text-[10px] font-medium text-[#5A5E72]">Smart Finance Tracker</div>
+            <div className="text-[10px] font-medium text-[#5A5E72]">{user.email}</div>
           </div>
         </div>
         <div className="flex items-center gap-1.5">
           <input type="month" value={selectedMonth} onChange={(e) => setSelectedMonth(e.target.value)} className="rounded-lg border border-[#1E2030] bg-[#161825] px-2.5 py-1.5 text-xs text-[#E2E4EA] outline-none" />
           <button onClick={() => setShowExport(true)} className="rounded-lg border border-[#1E2030] bg-[#161825] px-2.5 py-1.5 text-xs text-[#5A5E72] cursor-pointer">⚙️</button>
+          <button onClick={signOut} className="rounded-lg border border-[#F9706630] bg-[#F9706610] px-2.5 py-1.5 text-xs font-semibold text-[#F97066] cursor-pointer">Logout</button>
         </div>
       </div>
 
@@ -269,7 +307,6 @@ export default function Home() {
         {/* ══ DASHBOARD ══ */}
         {activeTab === "dashboard" && (
           <div>
-            {/* Stats */}
             <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-3">
               {[
                 { label: "Saldo", value: fmt(balance), accent: balance >= 0 ? "#22C55E" : "#F97066", icon: "💎", sub: monthLabel },
@@ -285,7 +322,6 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Top insight */}
             {insights.length > 0 && (
               <div className="mb-5 flex items-center gap-2.5 rounded-xl border px-4 py-3" style={{
                 background: insights[0].type === "success" ? "#22C55E10" : insights[0].type === "danger" ? "#F9706610" : insights[0].type === "warning" ? "#F59E0B10" : "#6366F110",
@@ -296,7 +332,6 @@ export default function Home() {
               </div>
             )}
 
-            {/* Charts */}
             <div className="mb-6 grid grid-cols-1 gap-3.5 md:grid-cols-2">
               <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
                 <div className="mb-3.5 text-sm font-bold">Breakdown Pengeluaran</div>
@@ -317,7 +352,6 @@ export default function Home() {
                   </div>
                 ) : <div className="py-10 text-center text-xs text-[#5A5E72]">Belum ada data</div>}
               </div>
-
               <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
                 <div className="mb-3.5 text-sm font-bold">Kumulatif Harian</div>
                 {dailyData.length > 0 ? (
@@ -339,7 +373,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Budget preview */}
             {budgetData.length > 0 && (
               <div className="mb-6 rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
                 <div className="mb-3.5 flex items-center justify-between">
@@ -350,9 +383,7 @@ export default function Home() {
                   <div key={b.cat} className="mb-2.5">
                     <div className="mb-1 flex justify-between text-xs">
                       <span className="font-semibold">{b.icon} {b.cat}</span>
-                      <span className="text-[11px] font-semibold" style={{ fontFamily: "'IBM Plex Mono', monospace", color: b.pct >= 100 ? "#F97066" : b.pct >= 80 ? "#F59E0B" : "#22C55E" }}>
-                        {fmtShort(b.spent)} / {fmtShort(b.limit)} ({b.pct.toFixed(0)}%)
-                      </span>
+                      <span className="text-[11px] font-semibold" style={{ fontFamily: "'IBM Plex Mono', monospace", color: b.pct >= 100 ? "#F97066" : b.pct >= 80 ? "#F59E0B" : "#22C55E" }}>{fmtShort(b.spent)} / {fmtShort(b.limit)} ({b.pct.toFixed(0)}%)</span>
                     </div>
                     <div className="h-1.5 overflow-hidden rounded-full bg-[#1E2030]">
                       <div className="h-full rounded-full transition-all duration-500" style={{ width: Math.min(b.pct, 100) + "%", background: b.pct >= 100 ? "#F97066" : b.pct >= 80 ? "#F59E0B" : "#22C55E" }} />
@@ -362,7 +393,6 @@ export default function Home() {
               </div>
             )}
 
-            {/* Recent transactions */}
             <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
               <div className="mb-2.5 text-sm font-bold">Transaksi Terbaru</div>
               {sortedTxs.length > 0 ? sortedTxs.slice(0, 5).map((tx) => (
@@ -372,7 +402,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══ TRANSACTIONS ══ */}
         {activeTab === "transactions" && (
           <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
             <div className="mb-3.5 flex items-center justify-between">
@@ -385,7 +414,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══ BUDGET ══ */}
         {activeTab === "budget" && (
           <div>
             <div className="mb-4 flex items-center justify-between">
@@ -432,7 +460,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══ GOALS ══ */}
         {activeTab === "goals" && (
           <div>
             <div className="mb-4 flex items-center justify-between">
@@ -449,8 +476,7 @@ export default function Home() {
                   const remaining = g.target - g.saved
                   let monthsLeft: number | null = null
                   if (g.deadline) {
-                    const dl = new Date(g.deadline)
-                    const now = new Date()
+                    const dl = new Date(g.deadline); const now = new Date()
                     monthsLeft = Math.max(0, (dl.getFullYear() - now.getFullYear()) * 12 + dl.getMonth() - now.getMonth())
                   }
                   const perMonth = monthsLeft && monthsLeft > 0 ? remaining / monthsLeft : null
@@ -493,34 +519,26 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══ INSIGHTS ══ */}
         {activeTab === "insights" && (
           <div>
             <div className="text-lg font-bold">🧠 Smart Insights</div>
-            <div className="mb-5 text-xs text-[#5A5E72]">Analisis otomatis keuangan kamu — {monthLabel}</div>
-
+            <div className="mb-5 text-xs text-[#5A5E72]">Analisis otomatis — {monthLabel}</div>
             {insights.length > 0 ? (
               <div className="mb-7 flex flex-col gap-2.5">
                 {insights.map((ins, i) => (
                   <div key={i} className="flex items-start gap-3 rounded-xl border bg-[#161825] px-4 py-3.5" style={{
                     borderColor: ins.type === "success" ? "#22C55E20" : ins.type === "danger" ? "#F9706620" : ins.type === "warning" ? "#F59E0B20" : "#1E2030",
-                    borderLeftWidth: 3,
-                    borderLeftColor: ins.type === "success" ? "#22C55E" : ins.type === "danger" ? "#F97066" : ins.type === "warning" ? "#F59E0B" : "#6366F1",
+                    borderLeftWidth: 3, borderLeftColor: ins.type === "success" ? "#22C55E" : ins.type === "danger" ? "#F97066" : ins.type === "warning" ? "#F59E0B" : "#6366F1",
                   }}>
                     <span className="mt-0.5 shrink-0 text-xl">{ins.icon}</span>
                     <span className="text-sm font-medium leading-relaxed text-[#C8CAD4]">{ins.text}</span>
                   </div>
                 ))}
               </div>
-            ) : (
-              <div className="mb-7 rounded-2xl border border-[#1E2030] bg-[#161825] py-10 text-center text-xs text-[#5A5E72]">
-                Tambahkan transaksi untuk mendapatkan insights!
-              </div>
-            )}
+            ) : <div className="mb-7 rounded-2xl border border-[#1E2030] bg-[#161825] py-10 text-center text-xs text-[#5A5E72]">Tambahkan transaksi untuk insights!</div>}
 
-            {/* 6-month trend */}
             <div className="mb-5 rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
-              <div className="mb-3.5 text-sm font-bold">📊 Tren 6 Bulan Terakhir</div>
+              <div className="mb-3.5 text-sm font-bold">📊 Tren 6 Bulan</div>
               <ResponsiveContainer width="100%" height={200}>
                 <BarChart data={monthlyTrend} barGap={4}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#1E2030" />
@@ -534,9 +552,8 @@ export default function Home() {
               </ResponsiveContainer>
             </div>
 
-            {/* Monthly report */}
-            <div className="mb-5 rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
-              <div className="mb-3.5 text-sm font-bold">📋 Laporan Bulanan — {monthLabel}</div>
+            <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
+              <div className="mb-3.5 text-sm font-bold">📋 Laporan — {monthLabel}</div>
               <div className="mb-3 grid grid-cols-2 gap-2.5">
                 <div className="rounded-lg border border-[#22C55E20] bg-[#22C55E08] p-3.5">
                   <div className="text-[10px] font-bold uppercase tracking-wider text-[#22C55E]">Pemasukan</div>
@@ -553,61 +570,27 @@ export default function Home() {
                 {totalIncome > 0 && <div className="mt-1 text-xs text-[#5A5E72]">Savings rate: {((balance / totalIncome) * 100).toFixed(1)}%</div>}
               </div>
             </div>
-
-            {/* Top categories */}
-            <div className="rounded-2xl border border-[#1E2030] bg-[#161825] p-4">
-              <div className="mb-3.5 text-sm font-bold">🏷 Top Kategori Pengeluaran</div>
-              {expByCategory.length > 0 ? expByCategory.map((c, i) => {
-                const pct = totalExpense > 0 ? Math.round((c.value / totalExpense) * 100) : 0
-                return (
-                  <div key={c.name} className="mb-3">
-                    <div className="mb-1 flex justify-between text-xs">
-                      <span className="font-semibold">{i + 1}. {c.name}</span>
-                      <span className="text-[11px] font-bold" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(c.value)} ({pct}%)</span>
-                    </div>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-[#1E2030]">
-                      <div className="h-full rounded-full transition-all duration-500" style={{ width: pct + "%", background: c.color }} />
-                    </div>
-                  </div>
-                )
-              }) : <div className="py-8 text-center text-xs text-[#5A5E72]">Belum ada data</div>}
-            </div>
           </div>
         )}
       </div>
 
       {/* FAB */}
-      <button onClick={() => { setEditingTx(null); setShowTxForm(true) }} className="fixed bottom-5 right-5 z-50 flex h-13 w-13 items-center justify-center rounded-2xl border-none text-2xl text-white cursor-pointer transition-transform hover:scale-110" style={{ background: "linear-gradient(135deg,#6366F1,#A855F7)", boxShadow: "0 8px 32px rgba(99,102,241,0.4)" }}>
-        +
-      </button>
+      <button onClick={() => { setEditingTx(null); setShowTxForm(true) }} className="fixed bottom-5 right-5 z-50 flex h-13 w-13 items-center justify-center rounded-2xl border-none text-2xl text-white cursor-pointer transition-transform hover:scale-110" style={{ background: "linear-gradient(135deg,#6366F1,#A855F7)", boxShadow: "0 8px 32px rgba(99,102,241,0.4)" }}>+</button>
 
       {/* Modals */}
       {showTxForm && <TransactionForm onSave={saveTx} onClose={() => { setShowTxForm(false); setEditingTx(null) }} initial={editingTx} />}
-      {showBudgetForm && <BudgetForm budgets={budgets} onSave={setBudgets} onClose={() => setShowBudgetForm(false)} month={monthLabel} />}
-      {showGoalForm && <GoalForm onSave={saveGoal} onClose={() => { setShowGoalForm(false); setEditingGoal(null) }} initial={editingGoal} />}
+      {showBudgetForm && <BudgetForm budgets={budgets} onSave={handleSaveBudgets} onClose={() => setShowBudgetForm(false)} month={monthLabel} />}
+      {showGoalForm && <GoalForm onSave={saveGoalHandler} onClose={() => { setShowGoalForm(false); setEditingGoal(null) }} initial={editingGoal} />}
 
-      {/* Export modal */}
       {showExport && (
         <Modal onClose={() => setShowExport(false)} title="⚙️ Settings & Export" width={400}>
           <div className="flex flex-col gap-2.5">
-            <button onClick={() => exportCSV(transactions)} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">
-              📄 Export CSV (semua transaksi)
-            </button>
-            <button onClick={() => exportJSON({ transactions, budgets, goals })} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">
-              💾 Backup JSON (semua data)
-            </button>
-            <button onClick={() => fileInputRef.current?.click()} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">
-              📥 Import dari JSON backup
-            </button>
+            <button onClick={() => exportCSV(transactions)} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">📄 Export CSV</button>
+            <button onClick={() => exportJSON({ transactions, budgets, goals })} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">💾 Backup JSON</button>
+            <button onClick={() => fileInputRef.current?.click()} className="w-full rounded-lg border border-[#1E2030] bg-[#161825] py-3 pl-4 text-left text-sm font-semibold text-[#E2E4EA] cursor-pointer">📥 Import JSON</button>
             <input ref={fileInputRef} type="file" accept=".json" onChange={handleImport} className="hidden" />
-            <div className="my-1.5 h-px bg-[#1E2030]" />
-            <button onClick={() => { resetAll(); setShowExport(false) }} className="w-full rounded-lg border border-[#F9706630] bg-[#F9706610] py-3 text-sm font-bold text-[#F97066] cursor-pointer">
-              🗑 Reset Semua Data
-            </button>
           </div>
-          <div className="mt-3.5 text-center text-[10px] leading-relaxed text-[#5A5E72]">
-            DompetKu v2.0 — Data tersimpan di device kamu.<br />Gunakan backup JSON untuk pindah device.
-          </div>
+          <p className="mt-3.5 text-center text-[10px] text-[#5A5E72]">DompetKu v2.0 — Data tersimpan di Supabase cloud ☁️</p>
         </Modal>
       )}
     </div>
